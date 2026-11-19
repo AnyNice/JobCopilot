@@ -1,5 +1,6 @@
 // ===== 小北智能招聘 Service Worker：编排 收集→筛选→审核→投递 + 自定义 LLM =====
 importScripts('/src/selectors.js'); // 让 SW 也能用 CITY_MAP（否则城市永远是全国）
+importScripts('/src/salary.js'); // BOSS 薪资字体解码 BOSS_SALARY（第一批合并移植自 kunshanyep-beep 版）
 importScripts('/src/filters.js'); // 岗位过滤引擎（规则过滤前置，省 API）
 importScripts('/src/amap.js'); // 高德通勤计算（投递期预计算 job.commute）
 
@@ -270,6 +271,14 @@ async function opencodeSessionId() {
   return _ocSessionId;
 }
 
+// -- pendingLLM: in-flight LLM registry (batch1, from kunshan pendingAI idea) --
+// callLLM already had AbortController timeout (default 90s) and 429/503 retry;
+// this adds registration so STOP can abort in-flight requests immediately.
+const pendingLLM = new Set();
+function abortPendingLLM() {
+  pendingLLM.forEach(c => { try { c.abort(); } catch (e) {} });
+}
+
 // ── 自定义 LLM(OpenAI 兼容协议) ──
 async function callLLM(messages, maxTokens, opts) {
   const cfg = await getCfg();
@@ -288,6 +297,7 @@ async function callLLM(messages, maxTokens, opts) {
   const timeoutMs = (opts && opts.timeoutMs) || 90000;
   const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
   const timer = controller ? setTimeout(() => { try { controller.abort(); } catch (e) {} }, timeoutMs) : null;
+  if (controller) pendingLLM.add(controller);
   let resp;
   try {
     // 限流/暂时不可用：最多重试 2 次（退避 1s、2s），其余状态码只试一次
@@ -316,6 +326,7 @@ async function callLLM(messages, maxTokens, opts) {
     }
   } finally {
     if (timer) clearTimeout(timer);
+    if (controller) pendingLLM.delete(controller);
   }
   if (!resp.ok) { const t = await resp.text().catch(() => ''); throw new Error('API ' + resp.status + ': ' + t.slice(0, 200)); }
   const data = await resp.json();
@@ -353,7 +364,7 @@ async function screenJob(cfg, job) {
   const lvl = filterCfg(cfg).screenLevel || 'balanced';
   const sys = SCREEN_SYS[lvl] || SCREEN_SYS.balanced;
   const user = '求职者简历：\n' + resumeFull(cfg) + '\n\n待判断岗位：\n' + jobInfo(job) + '\n\n严格输出JSON。';
-  const raw = await callLLM([{ role: 'system', content: sys }, { role: 'user', content: user }], 4096, { json: true, noThink: true });
+  const raw = await callLLM([{ role: 'system', content: sys }, { role: 'user', content: user }], 4096, { json: true, noThink: true, timeoutMs: 25000 });
   const p = parseMatch(raw);
   if (!p) return { match: false, reason: 'AI解析失败', score: 0, flags: [] };
   const match = p.match === true || p.match === 'true';
@@ -383,13 +394,79 @@ function renderTemplate(tpl, job, cfg) {
   return out.replace(/\{\{[^}]*\}\}/g, '').replace(/[ \t]+/g, ' ').trim(); // 清掉未识别的变量占位
 }
 
+// -- HR call-name (batch1, ported from YouYou0323 background.js; its FALLBACK_GREETING with a real resume was NOT ported) --
+// 常见复姓（保守起见复姓不自动加称呼，避免"欧姐/欧哥"式尴尬）
+const COMPOUND_SURNAMES = ['欧阳', '司马', '诸葛', '上官', '东方', '慕容', '独孤', '夏侯', '尉迟', '公孙', '皇甫', '南宫', '端木', '轩辕', '令狐', '闻人', '司徒', '司空', '长孙', '申屠', '公冶', '宗政', '濮阳', '淳于', '单于', '太叔'];
+// 强性别倾向用字（名中命中即推断，宁缺毋滥，中性字一律不收）
+const MALE_CHARS = '伟强磊军杰涛斌勇超浩鹏峰飞亮刚建东志波辉凯鑫博俊林海富坤铭勋腾翔健威锋岩松毅晨豪康宏泽轩然昊睿天翼航硕辰启瑞鸿达庆权汉彬彪帅迪帆舟';
+const FEMALE_CHARS = '芳敏静丽娟燕婷雪梅红霞英玉秀兰慧洁怡淑妍丹娜媛萍玲凤美琴云珍蓉虹颖珊琪瑶萌婉蕾莉薇萱诺欣梦佳月秋露晶甜艺蕊芸';
+
+function nameGender(name) {
+  if (!name) return null;
+  let male = 0, female = 0;
+  for (const ch of name) {
+    if (MALE_CHARS.indexOf(ch) >= 0) male++;
+    if (FEMALE_CHARS.indexOf(ch) >= 0) female++;
+  }
+  if (male && !female) return '男';
+  if (female && !male) return '女';
+  return null; // 都命中或都没命中 → 不确定
+}
+
+// 从 HR 名字推导称呼：先生/女士后缀最可靠；没有后缀时按姓名用字性别偏好推断；
+// 仍不确定一律返回 null（不硬叫，避免叫错性别）
+function deriveCallName(job) {
+  const n = (job.hrName || '').trim();
+  if (!n) return null;
+  // 1) 姓+先生/女士（如 李女士、王先生），兼容 "高女士·HR"、"招聘经理·高女士" 等附加文本
+  let m = n.match(/^([\u4e00-\u9fa5]{1,2})(先生|女士)/);
+  if (!m) m = n.match(/[\s·|｜\-:：,，、]([\u4e00-\u9fa5]{1,2})(先生|女士)$/);
+  if (m) {
+    if (COMPOUND_SURNAMES.indexOf(m[1]) >= 0) return null; // 复姓，保守不称呼
+    const surname = m[1];
+    return m[2] === '先生' ? surname + '哥' : surname + '姐';
+  }
+  // 2) 纯中文姓名（如 张伟、李静）按名推断性别
+  const pure = (n.match(/[\u4e00-\u9fa5]{2,4}/) || [''])[0];
+  if (pure.length < 2) return null;
+  let surname = pure.charAt(0);
+  for (const cs of COMPOUND_SURNAMES) {
+    if (pure.indexOf(cs) === 0) { surname = cs; break; }
+  }
+  const given = pure.slice(surname.length);
+  const g = nameGender(given);
+  if (!g) return null;
+  return g === '男' ? surname + '哥' : surname + '姐';
+}
+
+// 固定招呼语前追加称呼（称呼可推导且未以称呼开头时），AI 兜底同样适用
+function withCallName(fixed, callName) {
+  let text = (fixed || '').trim();
+  if (!text) return '';
+  if (callName && text.indexOf(callName) !== 0) {
+    const rest = text.replace(/^(您好|你好)[，,！!、\s]*/, '');
+    text = callName + '，您好！' + rest;
+  }
+  return text;
+}
+
 // 投递时：结合该岗位的【完整JD】+ 简历，现场生成专属招呼语
 async function genGreetingFromJD(cfg, job, jd) {
-  const sys = '你是求职者本人，在BOSS直聘给HR发招呼语。回复会原样发给HR，严禁任何注释、说明、括号备注、字数统计或引导语。\n【格式】1.开头前15字必须是"熟悉XXX、XXX"(填该JD要求且你简历具备的核心技能1-2个)。2.紧接"做过XXX"说明简历里与该岗位相关的具体项目/经历。3.全文80-120字，真诚自然。';
+  const callName = deriveCallName(job);
+  const callRule = callName
+    ? '开头第一句必须先写称呼「' + callName + '，您好！」，例如：「' + callName + '，您好！我熟悉…」'
+    : '开头第一句必须先写「您好！」问候，例如：「您好！我熟悉…」';
+  const sys = '你是求职者本人，在BOSS直聘给HR发招呼语。回复会原样发给HR，严禁任何注释、说明、括号备注、字数统计或引导语。\n【格式】1.' + callRule + '。2.紧接"做过XXX"说明简历里与该岗位相关的具体项目/经历。3.全文80-120字，真诚自然。';
   const jdText = (jd && jd.trim()) ? jd.trim() : ('技能标签：' + (job.tags || []).join('、'));
-  const user = '我的简历：\n' + resumeFull(cfg) + '\n\n目标岗位：' + (job.name || '') + (job.company ? ('（' + job.company + '）') : '') + '\n该岗位JD：\n' + jdText + '\n\n请按格式生成一段招呼语，开头必须"熟悉…"，直接输出招呼语本身，不要任何多余内容。';
-  const raw = await callLLM([{ role: 'system', content: sys }, { role: 'user', content: user }], 2048, { noThink: true });
-  return (raw || '').trim();
+  const user = '我的简历：\n' + resumeFull(cfg) + '\n\n目标岗位：' + (job.name || '') + (job.company ? ('（' + job.company + '）') : '') + '\n该岗位JD：\n' + jdText + '\n\n请按格式生成一段招呼语' + (callName ? '（HR姓' + callName.charAt(0) + '，开头必须称呼' + callName + '）' : '（开头必须先写"您好！"问候，再接"我熟悉…"）') + '，直接输出招呼语本身，不要任何多余内容。';
+  const raw = await callLLM([{ role: 'system', content: sys }, { role: 'user', content: user }], 2048, { noThink: true, timeoutMs: 30000 });
+  let greeting = (raw || '').trim();
+  // 称呼兜底：AI 偶尔不遵守"开头必须称呼"的指令，这里强制保证称呼出现在开头
+  if (callName && greeting && greeting.indexOf(callName) !== 0) {
+    const rest = greeting.replace(/^(您好|你好)[！!，,、\s]*/, '');
+    greeting = callName + '，您好！' + rest;
+  }
+  return greeting;
 }
 
 // ── tab 注入 + 发消息 ──
@@ -558,6 +635,18 @@ async function ensureTab(url) {
 async function getSearchTab(cfg) { return ensureTab(buildSearchUrl(cfg)); }
 function curUrl(tabId) { return new Promise(res => chrome.tabs.get(tabId, t => res((t && t.url) || ''))); }
 
+// -- screened per-item persistence (batch1, from kunshan idea) --
+// Serialized promise chain writes snapshots so concurrent screening cannot interleave storage writes.
+let screenedPersistChain = Promise.resolve();
+function persistScreened() {
+  const jobsSnap = state.jobs.slice();
+  const screenedSnap = state.screened.slice();
+  screenedPersistChain = screenedPersistChain.then(() =>
+    chrome.storage.local.set({ sw_jobs: jobsSnap, sw_screened: screenedSnap })
+  ).catch(() => {});
+  return screenedPersistChain;
+}
+
 // ── 流程：收集 + 筛选 ──
 async function runCollect() {
   state.aborted = false; state.paused = false; state.verifyPending = false;
@@ -629,8 +718,26 @@ async function runCollect() {
         } else { res = { match: false, reason: '筛选异常:' + e.message, score: 0, flags: [] }; }
       }
       state.screened.push(Object.assign({}, job, { match: res.match, reason: res.reason, score: res.score, flags: res.flags || [] }));
+      persistScreened();
       done++; progress(done, total, '筛选');
     }));
+  }
+  if (state.aborted && authFail >= 2) {
+    await screenedPersistChain;
+    try { await chrome.storage.local.remove(['sw_jobs', 'sw_screened']); } catch (e) {}
+    log('筛选已中止，本轮结果未保存。修复配置后重新开始', 'warn');
+    state.phase = 'idle'; pushPhase();
+    return;
+  }
+  if (state.aborted && state.screened.length) {
+    const savedCount = state.screened.length;
+    ruleDropped.forEach(j => state.screened.push(Object.assign({}, j, { match: false, reason: '规则：' + (j._dropReason || '') })));
+    await screenedPersistChain;
+    await chrome.storage.local.set({ sw_jobs: state.jobs, sw_greetings: state.greetings, sw_screened: state.screened });
+    log('筛选已停止，已保存 ' + savedCount + ' 个已筛结果，可继续审核', 'warn');
+    state.phase = 'review'; pushPhase();
+    chrome.runtime.sendMessage({ type: 'SCREENED', screened: state.screened }).catch(() => {});
+    return;
   }
   if (state.aborted) {
     log('筛选已中止，本轮结果未保存。修复配置后重新开始', 'warn');
@@ -644,6 +751,7 @@ async function runCollect() {
   // "保留展示"的规则剔除岗位：进审核列表置灰，默认不勾选
   ruleDropped.forEach(j => state.screened.push(Object.assign({}, j, { match: false, reason: '规则：' + (j._dropReason || '') })));
   // 存盘：SW 可能在审核期间被浏览器回收，投递时需从存储读回
+  await screenedPersistChain;
   await chrome.storage.local.set({ sw_jobs: state.jobs, sw_greetings: state.greetings, sw_screened: state.screened });
   state.phase = 'review'; pushPhase();
   chrome.runtime.sendMessage({ type: 'SCREENED', screened: state.screened }).catch(() => {});
@@ -764,9 +872,12 @@ async function runDeliver(jobIds) {
     const tpl = (cfg.greetingTemplate || '').trim();
     let greeting = '';
     let via = 'AI';
+    const callName = deriveCallName(job);
+    if (callName) log('  称呼：' + callName);
     try { greeting = await genGreetingFromJD(cfg, job, jd); } catch (e) { log('  生成失败：' + e.message, 'error'); }
     if (!greeting && tpl) {
       greeting = renderTemplate(tpl, job, cfg);
+      greeting = withCallName(greeting, callName);
       if (greeting) { via = '模板'; log('  AI 不可用，已按自定义模板生成兜底招呼语', 'warn'); }
     }
     if (!greeting) {
@@ -903,9 +1014,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     chrome.runtime.sendMessage({ type: 'VERIFY_CLEARED' }).catch(() => {});
     sendResponse({ ok: true }); return;
   }
-  if (msg.type === 'STOP') { state.aborted = true; state.paused = false; markRunEnd(); log('已停止', 'warn'); state.phase = 'idle'; pushPhase(); sendResponse({ ok: true }); return; }
+  if (msg.type === 'STOP') { state.aborted = true; state.paused = false; abortPendingLLM(); markRunEnd(); log('已停止', 'warn'); state.phase = 'idle'; pushPhase(); sendResponse({ ok: true }); return; }
   if (msg.type === 'RESET') { state.processed = {}; chrome.storage.local.set({ processed: {} }); state.jobs = []; state.screened = []; state.greetings = {}; state.results = []; markRunEnd(); state.phase = 'idle'; pushPhase(); log('已重置（清空本轮已投记录；企业去重记录保留）', 'warn'); sendResponse({ ok: true }); return; }
-  if (msg.type === 'GET_STATE') { sendResponse({ phase: state.phase, screened: state.screened }); return; }
+  if (msg.type === 'GET_STATE') {
+    if (state.screened.length) { sendResponse({ phase: state.phase, screened: state.screened }); return; }
+    (async () => {
+      try {
+        const d = await chrome.storage.local.get(['sw_screened', 'sw_jobs']);
+        if (!state.screened.length && d && Array.isArray(d.sw_screened) && d.sw_screened.length) {
+          state.screened = d.sw_screened;
+          if (!state.jobs.length && Array.isArray(d.sw_jobs)) state.jobs = d.sw_jobs;
+          if (state.phase === 'idle') state.phase = 'review';
+        }
+      } catch (e) {}
+      sendResponse({ phase: state.phase, screened: state.screened });
+    })();
+    return true;
+  }
   if (msg.type === 'RUN_FILTER_DRY') {
     (async () => {
       try {

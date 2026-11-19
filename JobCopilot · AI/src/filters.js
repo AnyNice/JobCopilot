@@ -60,7 +60,18 @@
   }
 
   function parseSalary(text) {
-    const s = String(text || '').replace(/\s+/g, '');
+    // 入口先解码 BOSS 私有字体薪资数字（U+E031-E03A → 0-9）：优先用全局 BOSS_SALARY，
+    // 全局不存在时（tests 单独加载 filters.js）用同样的内联映射兜底
+    let decoded = null;
+    try {
+      const sal = (typeof BOSS_SALARY !== 'undefined' && BOSS_SALARY) ? BOSS_SALARY
+        : (root && root.BOSS_SALARY ? root.BOSS_SALARY : null);
+      if (sal && typeof sal.normalize === 'function') decoded = sal.normalize(text || '');
+    } catch (e) {}
+    if (decoded == null) {
+      decoded = String(text || '').normalize('NFKC').replace(/[\ue031-\ue03a]/g, c => String(c.charCodeAt(0) - 0xe031));
+    }
+    const s = String(decoded || '').replace(/\s+/g, '');
     if (!s || /面议|商议|私聊/.test(s)) return null;
     let lo, hi, u1 = '', u2 = '';
     let m = s.match(/^(\d+(?:\.\d+)?)(万|K|k|千)?$/);

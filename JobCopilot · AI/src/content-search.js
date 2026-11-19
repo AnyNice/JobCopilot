@@ -38,7 +38,12 @@
     const link = linkEl ? linkEl.href : '';
     const m = link.match(/job_detail\/([^.?]+)\.html/);
     const name = cleanText(nameEl && nameEl.textContent) || '未知岗位';
-    const salary = cleanText(salEl && salEl.textContent);
+    // 薪资数字被 BOSS 私有字体编码在 U+E031-E03A，必须先解码再 cleanText，
+    // 否则 cleanText 会把私用区字符当图标字体删掉、薪资数字直接丢失（顺序不能反）
+    const salaryRaw = salEl ? salEl.textContent : '';
+    const salaryDecoded = (typeof BOSS_SALARY !== 'undefined' && BOSS_SALARY && typeof BOSS_SALARY.decodeDigits === 'function')
+      ? BOSS_SALARY.decodeDigits(salaryRaw || '') : (salaryRaw || '');
+    const salary = cleanText(salaryDecoded);
     const id = (m && m[1]) || (name + '|' + salary);
     const tags = Array.from(card.querySelectorAll(SELECTORS.jobs.tagList))
       .map(t => cleanText(t.textContent)).filter(Boolean);

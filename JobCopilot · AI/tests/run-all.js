@@ -8,4 +8,5 @@ require('./test-content-chat');
 require('./test-sidepanel');
 require('./test-upgrade');
 require('./test-review');
+require('./test-merge-batch1');
 runAll(process.argv[2]);
