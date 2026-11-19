@@ -1,6 +1,6 @@
 // ===== 小北智能招聘 侧边栏(自定义 LLM + 科技风 UI) =====
 const $ = (id) => document.getElementById(id);
-const CFG_FIELDS = ['apiBaseUrl', 'apiModel', 'apiKey', 'resumeText', 'greetingTemplate', 'keyword', 'city', 'count'];
+const CFG_FIELDS = ['apiBaseUrl', 'apiModel', 'apiKey', 'resumeText', 'greetingTemplate', 'keyword', 'city', 'jobType', 'count'];
 // 服务商预设：选一个自动填接口地址 + 模型（key 需用户自备，OpenCode 内置）
 const PRESETS = {
   opencode: { label: 'OpenCode', url: 'https://opencode.ai/zen/go/v1/chat/completions', model: 'deepseek-v4-flash', builtinKey: true },
@@ -188,7 +188,7 @@ $('resumeImg').addEventListener('change', (e) => {
 
 $('saveCfg').addEventListener('click', async () => {
   const obj = {};
-  CFG_FIELDS.forEach(f => { obj[f] = $(f).value; });
+  CFG_FIELDS.forEach(f => { const el = $(f); obj[f] = el ? el.value : ''; });
   await ensureEndpointPermission();
   chrome.storage.local.set(obj, () => {
     const s = $('saved');
@@ -204,7 +204,7 @@ async function saveCfgSync() {
   await ensureEndpointPermission();
   return new Promise(res => {
     const obj = {};
-    CFG_FIELDS.forEach(f => { obj[f] = $(f).value; });
+    CFG_FIELDS.forEach(f => { const el = $(f); obj[f] = el ? el.value : ''; });
     chrome.storage.local.set(obj, res);
   });
 }

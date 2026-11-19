@@ -9,4 +9,6 @@ require('./test-sidepanel');
 require('./test-upgrade');
 require('./test-review');
 require('./test-merge-batch1');
+require('./test-merge-batch2');
+require('./test-merge-batch3');
 runAll(process.argv[2]);

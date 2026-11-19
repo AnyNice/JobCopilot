@@ -153,8 +153,43 @@
     return { success: true, imageOk: img.ok, imageConfirmed: img.confirmed };
   }
 
+  // batch2 chat-page identity check (conservative, idea from ruiqiyang chat-page-identity):
+  // block ONLY on positive evidence of a mismatch; anything unreadable passes.
+  function checkConversationIdentity(expect) {
+    if (!expect) return { ok: true };
+    if (expect.jobId) {
+      let urlJobId = '';
+      try {
+        const qs = new URLSearchParams((String(location.href || '').split('?')[1] || '').split('#')[0]);
+        urlJobId = qs.get('jobId') || qs.get('job_id') || '';
+        if (!urlJobId) {
+          const m = String(location.href || '').match(/job_detail\/([^.?&#/]+)\.html/);
+          if (m) urlJobId = m[1];
+        }
+      } catch (e) {}
+      if (urlJobId && urlJobId !== expect.jobId) return { ok: false, err: '会话岗位不一致' };
+    }
+    if (expect.company) {
+      let titleText = '';
+      try {
+        const titleEl = document.querySelector(SELECTORS.chat.userCompany) || document.querySelector('.title-box, [class*="title-box"]');
+        if (titleEl) titleText = (titleEl.textContent || '').replace(/\s/g, '');
+      } catch (e) {}
+      if (titleText) {
+        const comp = String(expect.company).replace(/\s/g, '');
+        const pos = String(expect.position || '').replace(/\s/g, '');
+        if (titleText.indexOf(comp) < 0 && (!pos || titleText.indexOf(pos) < 0)) {
+          return { ok: false, err: '会话岗位不一致' };
+        }
+      }
+    }
+    return { ok: true };
+  }
+
   // 发给当前已打开的会话（点继续沟通后跳进来的就是目标岗位，无需匹配）
-  async function sendActive(image, greeting) {
+  async function sendActive(image, greeting, expect) {
+    const idc = checkConversationIdentity(expect);
+    if (!idc.ok) return { success: false, error: idc.err };
     let input = await waitVisible(INPUT_SELS, 6000);
     if (!input) {
       const items = document.querySelectorAll(SELECTORS.chat.userList);
@@ -178,7 +213,7 @@
       return true;
     }
     if (msg.type === 'SEND_ACTIVE') {
-      sendActive(msg.image, msg.greeting).then(r => sendResponse(r)).catch(e => sendResponse({ success: false, error: e.message }));
+      sendActive(msg.image, msg.greeting, (msg.jobId || msg.company || msg.position) ? { jobId: msg.jobId || '', company: msg.company || '', position: msg.position || '' } : undefined).then(r => sendResponse(r)).catch(e => sendResponse({ success: false, error: e.message }));
       return true;
     }
   });

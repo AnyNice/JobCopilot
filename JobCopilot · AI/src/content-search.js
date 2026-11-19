@@ -78,13 +78,32 @@
     };
   }
 
+  // batch2 pagination (selector set adapted from kunshan content-search pagination()/disabled())
+  function findNextPageBtn() {
+    const candidates = Array.from(document.querySelectorAll('.options-pages .next, .page-next, .pagination .next, .pagination-next, .ui-pagination-next, .el-pagination .btn-next, .ant-pagination-next, [title="下一页"], [aria-label="下一页"], a[rel="next"]'));
+    const byText = Array.from(document.querySelectorAll('.options-pages a, .options-pages button, [class*="pagination"] a, [class*="pagination"] button'))
+      .filter(el => /^(下一页|下页|Next)$/i.test((el.textContent || '').trim()));
+    const next = candidates.concat(byText).find(el => isVisible(el));
+    if (!next) return null;
+    return (typeof next.matches === 'function' && next.matches('a, button')) ? next : (next.querySelector ? (next.querySelector('a, button') || next) : next);
+  }
+  function nextPageDisabled(el) {
+    if (!el) return true;
+    if (el.disabled) return true;
+    if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') return true;
+    if (/(^|\s)(disabled|is-disabled)(\s|$)/.test(String(el.className || ''))) return true;
+    if (el.parent && /(^|\s)(disabled|is-disabled)(\s|$)/.test(String(el.parent.className || ''))) return true;
+    return false;
+  }
+
   async function scrape(count) {
     const seen = {};
     const jobs = [];
     let stall = 0;
+    let pages = 1;
     // 慢网络/页面刚渲染完：先等首批卡片出现（最多 4 秒），避免"0 卡片"被误判成无岗
     await waitCardsGrow(0, 4000);
-    for (let loop = 0; loop < 40 && jobs.length < count && stall < 4; loop++) {
+    for (let loop = 0; loop < 60 && jobs.length < count && stall < 4; loop++) {
       const cards = getCards();
       let added = 0;
       for (const c of cards) {
@@ -93,13 +112,25 @@
       }
       if (added === 0) stall++; else stall = 0;
       if (jobs.length >= count) break;
+      // batch2: scrolling stalled - follow the pager before giving up (no pager -> unchanged behaviour)
+      if (stall >= 2) {
+        const nextBtn = findNextPageBtn();
+        if (nextBtn && !nextPageDisabled(nextBtn)) {
+          const beforeCards = getCards().length;
+          nextBtn.click();
+          pages++;
+          stall = 0;
+          await waitCardsGrow(beforeCards, 1500);
+          continue;
+        }
+      }
       window.scrollTo(0, document.body.scrollHeight);
       const container = document.querySelector('.job-list-container, .job-list-box, [class*="job-list"]');
       if (container) container.scrollTop = container.scrollHeight;
       const before = jobs.length;
       await waitCardsGrow(before, 1500);
     }
-    return jobs.slice(0, count);
+    return { jobs: jobs.slice(0, count), pages: pages };
   }
 
   function findCardByJob(job) {
@@ -119,6 +150,49 @@
       const container = document.querySelector('.job-list-container, .job-list-box, [class*="job-list"]');
       if (container) container.scrollTop = container.scrollHeight;
       await waitCardsGrow(before, 1100);
+    }
+    return null;
+  }
+
+  // batch2 (from kunshanyep exact-delivery fix): strict finders - id equality only, no fuzzy fallback.
+  // parseCard id is deterministic (link id, or name|salary), so strict equality also holds without a link id.
+  function findCardByJobStrict(job) {
+    if (!job || !job.id) return null;
+    const cards = getCards();
+    for (const c of cards) { const j = parseCard(c); if (j.id === job.id) return c; }
+    return null;
+  }
+
+  async function findCardByJobScrollStrict(job) {
+    for (let i = 0; i < 15; i++) {
+      const c = findCardByJobStrict(job);
+      if (c) return c;
+      const before = getCards().length;
+      window.scrollTo(0, document.body.scrollHeight);
+      const container = document.querySelector('.job-list-container, .job-list-box, [class*="job-list"]');
+      if (container) container.scrollTop = container.scrollHeight;
+      await waitCardsGrow(before, 1100);
+    }
+    return null;
+  }
+
+  // openJD locator: strict first; fuzzy name+company only to locate a card whose real id is
+  // then reported back as cardId - the background hard-checks it before anything is sent.
+  async function findCardForOpenJD(job) {
+    let c = findCardByJobStrict(job);
+    if (c) return c;
+    c = findCardByJob(job);
+    if (c) return c;
+    for (let i = 0; i < 15; i++) {
+      const before = getCards().length;
+      window.scrollTo(0, document.body.scrollHeight);
+      const container = document.querySelector('.job-list-container, .job-list-box, [class*="job-list"]');
+      if (container) container.scrollTop = container.scrollHeight;
+      await waitCardsGrow(before, 1100);
+      c = findCardByJobStrict(job);
+      if (c) return c;
+      c = findCardByJob(job);
+      if (c) return c;
     }
     return null;
   }
@@ -217,8 +291,9 @@
 
   // 点开卡片 → 抓取右侧详情面板的完整JD + HR名
   async function openJD(job) {
-    const card = await findCardByJobScroll(job);
+    const card = await findCardForOpenJD(job);
     if (!card) return { success: false, error: '未找到岗位卡片' };
+    const cardId = parseCard(card).id;
     card.scrollIntoView({ block: 'center' });
     await sleep(200);
     card.click();
@@ -263,35 +338,65 @@
         if (!fundText && /注册资本/.test(ln)) fundText = ln;
       }
     }
-    return { success: true, jd: jd.slice(0, 1800), hrName: hrName, addr: addr, fundText: fundText };
+    return { success: true, jd: jd.slice(0, 1800), hrName: hrName, addr: addr, fundText: fundText, cardId: cardId };
+  }
+
+  // batch2: the chat button is only ever searched inside the detail panel or the exact
+  // reviewed card - never by scanning the whole page (that could hit another job's button).
+  function findDetailPanel() {
+    return document.querySelector('.job-detail-box, [class*="job-detail"], .detail-content');
+  }
+  function findChatBtnIn(root) {
+    if (!root) return null;
+    const direct = root.querySelector(SELECTORS.jobs.immediateChatBtn);
+    if (direct && isVisible(direct)) return direct;
+    const els = root.querySelectorAll('a, button, span');
+    for (const el of els) {
+      const tx = (el.textContent || '').trim();
+      if ((tx === '立即沟通' || tx === '继续沟通') && isVisible(el)) return el;
+    }
+    return null;
+  }
+  async function waitChatBtn(card, timeout) {
+    const t0 = Date.now();
+    for (;;) {
+      const btn = findChatBtnIn(findDetailPanel()) || findChatBtnIn(card);
+      if (btn) return btn;
+      if (Date.now() - t0 > timeout) return null;
+      await sleep(200);
+    }
   }
 
   // 卡片已打开 → 点立即沟通 → 弹窗点"继续沟通"（跳转聊天页）；识别平台配额弹窗
   async function goChat(job) {
-    let btn = await waitFor(SELECTORS.jobs.immediateChatBtn, 5000);
-    if (!btn) {
-      const all = document.querySelectorAll('a, button, span');
-      for (const el of all) { const tx = (el.textContent || '').trim(); if (tx === '立即沟通' || tx === '继续沟通') { btn = el; break; } }
-    }
-    if (!btn) { // 面板可能关了，重新点卡片
-      const card = findCardByJob(job);
-      if (card) { card.click(); await sleep(800); btn = await waitFor(SELECTORS.jobs.immediateChatBtn, 4000); }
+    const card = await findCardByJobScrollStrict(job);
+    const cardId = card ? parseCard(card).id : '';
+    let btn = await waitChatBtn(card, 5000);
+    if (!btn && card) { // 面板可能关了，严格重开同一张卡再试一次
+      card.scrollIntoView({ block: 'center' });
+      card.click();
+      await sleep(800);
+      btn = await waitChatBtn(card, 4000);
     }
     if (!btn) return { success: false, error: '未找到立即沟通按钮' };
     btn.click();
     // 条件等待：先到先得——"继续沟通"按钮 / 平台配额弹窗 / 超时
     const r = await waitContinueOrQuota(6000);
     if (r && r.quota) {
-      return { success: false, quota: true, error: '平台提示：' + (r.text || '今日沟通名额已用完') };
+      const outQ = { success: false, quota: true, error: '平台提示：' + (r.text || '今日沟通名额已用完') };
+      if (cardId) outQ.cardId = cardId;
+      return outQ;
     }
-    if (r && r.go) { r.go.click(); return { success: true, navigated: true }; }
-    return { success: true, navigated: false };
+    const out = { success: true, navigated: !!(r && r.go) };
+    if (r && r.go) r.go.click();
+    if (cardId) out.cardId = cardId;
+    return out;
   }
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type === 'PING') { sendResponse({ success: true, alive: true, verify: detectVerifyDom() }); return; }
     if (msg.type === 'SCRAPE') {
-      scrape(msg.count || 20).then(jobs => sendResponse({ success: true, jobs: jobs })).catch(e => sendResponse({ success: false, error: e.message }));
+      scrape(msg.count || 20).then(res => sendResponse({ success: true, jobs: res.jobs, pages: res.pages })).catch(e => sendResponse({ success: false, error: e.message }));
       return true;
     }
     if (msg.type === 'OPEN_JD') {
